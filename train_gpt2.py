@@ -14,18 +14,12 @@ import torch.nn.functional as F
 import torch.distributed as dist
 import torch._inductor.config as config
 from torch.nn.parallel import DistributedDataParallel as DDP
-from muon import MuonMD, MuonElasticWeightMD, AdamW_elastic_net
-from kron import Kron
-from kron_clip import Kron_clip
-from kron_mu import Kron_mu
-from kron_nz import Kron_nz
+from kron_m import Kron
 import wandb
 import random
-## 
-from init import * 
+
 
 wandb.login()
-
 adjectives = [
     "swift", "bold", "bright", "clever", "eager", "fierce", "gentle", "happy", 
     "keen", "lively", "mighty", "noble", "proud", "quick", "rapid", "sharp", 
@@ -91,13 +85,10 @@ class Muon(torch.optim.Optimizer):
         backend: The chosen backend for the orthogonalization step. (recommended: 'newtonschulz5')
         backend_steps: The number of iteration steps to use in the backend, if it is iterative.
     """
-    def __init__(self, params, lr=3e-4, momentum=0.95, nesterov=True,
-                 backend='newtonschulz5', backend_steps=5,
-                 rank=0, world_size=1):
+    def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True,
+                 backend='newtonschulz5', backend_steps=5):
         defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, backend=backend, backend_steps=backend_steps)
         super().__init__(params, defaults)
-        self.rank = rank
-        self.world_size = world_size
 
     def step(self):
 
@@ -113,7 +104,7 @@ class Muon(torch.optim.Optimizer):
             curr_idx = 0
             for i, p in enumerate(group['params']):
                 # luckily this will perfectly distribute a transformer with multiple of 4 layers to 8 GPUs
-                if i % self.world_size == self.rank:
+                if i % int(os.environ['WORLD_SIZE']) == int(os.environ['RANK']):
                     g = p.grad
                     assert g is not None
                     state = self.state[p]
@@ -141,11 +132,14 @@ class Muon(torch.optim.Optimizer):
 # -----------------------------------------------------------------------------
 # PyTorch nn.Module definitions for the GPT-2 model
 
+
 class Rotary(torch.nn.Module):
 
     def __init__(self, dim, base=10000):
         super().__init__()
-        self.inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
+        self.dim = dim
+        self.base = base
+        self.inv_freq = None
         self.seq_len_cached = None
         self.cos_cached = None
         self.sin_cached = None
@@ -153,9 +147,10 @@ class Rotary(torch.nn.Module):
     def forward(self, x):
         seq_len = x.shape[1]
         if seq_len != self.seq_len_cached:
+            self.inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2, device=x.device).float() / self.dim))
             self.seq_len_cached = seq_len
             t = torch.arange(seq_len, device=x.device).type_as(self.inv_freq)
-            freqs = torch.outer(t, self.inv_freq).to(x.device)
+            freqs = torch.outer(t, self.inv_freq)
             self.cos_cached = freqs.cos().bfloat16()
             self.sin_cached = freqs.sin().bfloat16()
         return self.cos_cached[None, :, None, :], self.sin_cached[None, :, None, :]
@@ -169,6 +164,10 @@ def apply_rotary_emb(x, cos, sin):
     y2 = x1 * (-sin) + x2 * cos
     return torch.cat([y1, y2], 3).type_as(x)
 
+class CastedLinear(nn.Linear):
+    def forward(self, x):
+        return F.linear(x, self.weight.to(x.dtype))
+
 class CausalSelfAttention(nn.Module):
 
     def __init__(self, config):
@@ -177,33 +176,37 @@ class CausalSelfAttention(nn.Module):
         self.n_embd = config.n_embd
         self.head_dim = self.n_embd // self.n_head
         assert self.n_embd % self.n_head == 0
-        self.c_q = nn.Linear(self.n_embd, self.n_embd, bias=False)
-        self.c_k = nn.Linear(self.n_embd, self.n_embd, bias=False)
-        self.c_v = nn.Linear(self.n_embd, self.n_embd, bias=False)
+        self.c_q = CastedLinear(self.n_embd, self.n_embd, bias=False)
+        self.c_k = CastedLinear(self.n_embd, self.n_embd, bias=False)
+        self.c_v = CastedLinear(self.n_embd, self.n_embd, bias=False)
         # output projection
-        self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
+        self.c_proj = CastedLinear(self.n_embd, self.n_embd, bias=False)
         self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
         self.rotary = Rotary(self.head_dim)
+        self.lamb = nn.Parameter(torch.tensor(0.5)) # @Grad62304977
 
-    def forward(self, x):
+    def forward(self, x, v1=None):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
         q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
         k = self.c_k(x).view(B, T, self.n_head, self.head_dim)
         v = self.c_v(x).view(B, T, self.n_head, self.head_dim)
+        if v1 is None:
+            v1 = v # This happens if we are in the first block. v needs to be accessed by subsequent blocks
+        v = (1 - self.lamb) * v + self.lamb * v1.view_as(v) # @Grad62304977
         cos, sin = self.rotary(q)
         q, k = F.rms_norm(q, (q.size(-1),)), F.rms_norm(k, (k.size(-1),)) # QK norm suggested by @Grad62304977
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
         y = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), is_causal=True)
         y = y.transpose(1, 2).contiguous().view_as(x) # re-assemble all head outputs side by side
         y = self.c_proj(y)
-        return y
+        return y, v1
 
 class MLP(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=False)
-        self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
+        self.c_fc    = CastedLinear(config.n_embd, 4 * config.n_embd, bias=False)
+        self.c_proj  = CastedLinear(4 * config.n_embd, config.n_embd, bias=False)
         self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
 
     def forward(self, x):
@@ -218,11 +221,14 @@ class Block(nn.Module):
         super().__init__()
         self.attn = CausalSelfAttention(config)
         self.mlp = MLP(config)
+        self.lambdas = nn.Parameter(torch.tensor([1., 0.]))
 
-    def forward(self, x):
-        x = x + self.attn(F.rms_norm(x, (x.size(-1),)))
+    def forward(self, x, v1, x0):
+        x = self.lambdas[0] * x + self.lambdas[1] * x0
+        x1, v1 = self.attn(F.rms_norm(x, (x.size(-1),)), v1)
+        x = x + x1
         x = x + self.mlp(F.rms_norm(x, (x.size(-1),)))
-        return x
+        return x, v1
 
 # -----------------------------------------------------------------------------
 # The main GPT-2 model
@@ -244,33 +250,25 @@ class GPT(nn.Module):
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
         ))
-        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-        self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
+        self.lm_head = CastedLinear(config.n_embd, config.vocab_size, bias=False)
+        self.lm_head.weight.data.zero_() # @Grad62304977
 
-    def forward(self, idx, targets=None, return_logits=True):
+    def forward(self, idx, target):
 
         # forward the GPT model itself
         x = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
+        x = F.rms_norm(x, (x.size(-1),)) # @Grad62304977
+        x0 = x
+        v1 = None
         for block in self.transformer.h:
-            x = block(x)
+            x, v1 = block(x, v1, x0)
         x = F.rms_norm(x, (x.size(-1),))
 
-        if targets is not None:
-            # if we are given some desired targets also calculate the loss
-            logits = self.lm_head(x)
-            logits = logits.float() # use tf32/fp32 for logits
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
-        else:
-            # inference-time mini-optimization: only forward the lm_head on the very last position
-            logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
-            logits = logits.float() # use tf32/fp32 for logits
-            loss = None
-
-        # there are performance reasons why not returning logits is prudent, if not needed
-        if not return_logits:
-            logits = None
-
-        return logits, loss
+        logits = self.lm_head(x)
+        logits = 30 * torch.tanh(logits / 30) # @Grad62304977
+        logits = logits.float()
+        loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target.view(-1))
+        return loss.float()
 
 # -----------------------------------------------------------------------------
 # Our own simple Distributed Data Loader
@@ -350,14 +348,6 @@ class DistributedDataLoader:
 # -----------------------------------------------------------------------------
 # int main
 
-def count_nonzero_params(model):
-    total_params = 0
-    nonzero_params = 0
-    for param in model.parameters():
-        total_params += param.numel()
-        nonzero_params += torch.count_nonzero(param).item()
-    return nonzero_params / total_params
-
 @dataclass
 class Hyperparameters:
     # data hyperparams
@@ -367,20 +357,18 @@ class Hyperparameters:
     batch_size : int = 8*64 # batch size, in sequences, across all devices
     device_batch_size : int = 64 # batch size, in sequences, per device
     sequence_length : int = 1024 # sequence length, in tokens
-    num_iterations : int = 5100 # number of iterations to run
-    embed_learning_rate : float = 0.0036/4
-    muon_learning_rate : float = 0.0018/4
+    num_iterations : int = 3242 # number of iterations to run
     warmup_iters : int = 0
-    warmdown_iters : int = 1450 # number of iterations of linear warmup/warmdown for triangular or trapezoidal schedule
+    warmdown_iters : int = 926 # number of iterations of linear warmup/warmdown for triangular or trapezoidal schedule
     weight_decay : float = 0
     # evaluation and logging hyperparams
     val_loss_every : int = 125 # every how many steps to evaluate val loss? 0 for only at the end
     val_tokens : int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     save_every : int = 0 # every how many steps to save the checkpoint? 0 for only at the end
-    count_nonzeros : bool = False  # new flag to control nonzero counting
     wandb_project : str = "nanoGPT-PSGD"
     wandb_run_name : str = None
     wandb_log : bool = True  # flag to enable/disable wandb logging
+
 args = Hyperparameters()
 
 # set up DDP or single GPU training
@@ -402,7 +390,6 @@ else:  # distributed training
 
 torch.cuda.set_device(device)
 print(f"using device: {device}")
-
 # convenience variables
 B, T = args.device_batch_size, args.sequence_length
 # calculate the number of steps to take in the val loop.
@@ -424,7 +411,6 @@ x, y = train_loader.next_batch()
 # this originates from Karpathy's experiments.
 num_vocab = 50304
 model = GPT(GPTConfig(vocab_size=num_vocab, n_layer=12, n_head=6, n_embd=768))
-
 model = model.cuda()
 if hasattr(config, "coordinate_descent_tuning"):
     config.coordinate_descent_tuning = True # suggested by @Chillee
@@ -434,27 +420,20 @@ model = DDP(model, device_ids=[ddp_local_rank])
 raw_model = model.module # always contains the "raw" unwrapped model
 ctx = torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16)
 
+# CUDNN attention is ~4ms faster than Flash, but doesn't get selected by default in PyTorch 2.5.1
+from torch.backends.cuda import enable_cudnn_sdp, enable_flash_sdp, enable_math_sdp, enable_mem_efficient_sdp
+enable_cudnn_sdp(True)
+enable_flash_sdp(False)
+enable_mem_efficient_sdp(False)
+enable_math_sdp(False)
 
 # init the optimizer(s)
-# meh lazy probs will work better. 
-# optimizer1 = torch.optim.AdamW(list(raw_model.lm_head.parameters()), lr=args.embed_learning_rate, betas=(0.9, 0.95),
-#                                weight_decay=args.weight_decay)
-# optimizer1 = Kron_nz([raw_model.transformer.wte.weight], 
-#                      lr=args.muon_learning_rate*10,
-#                      b1=0.9)
-# optimizer2 = Kron_nz([raw_model.lm_head.weight], 
-#                      lr=args.embed_learning_rate, 
-#                      b1=0.9 )
-# optimizer3 = Kron_nz(raw_model.transformer.h.parameters(), 
-#                      lr=args.muon_learning_rate,  
-#                      b1=0.9)
-# optimizers = [optimizer1, optimizer2, optimizer3]
-# you can switch out with Kron or Kron mu or Kron nz all work well -- lots of fun things we can do with PSGD style whitening.
-# have not tunded beta terms 
-optimizer1 = Kron_nz(raw_model.lm_head.parameters(), lr=args.embed_learning_rate)
-optimizer2 = Kron_nz(raw_model.transformer.h.parameters(), lr=args.muon_learning_rate)
-
-optimizers = [optimizer1, optimizer2]
+optimizer1 = torch.optim.Adam([raw_model.transformer.wte.weight], lr=0.3,   betas=(0.9, 0.95), fused=True)
+optimizer2 = torch.optim.Adam([raw_model.lm_head.weight],         lr=0.002, betas=(0.9, 0.95), fused=True)
+# optimizer1 = Kron([raw_model.transformer.wte.weight], lr=0.3/2,   b1=0.9)
+# optimizer2 = Kron([raw_model.lm_head.weight],         lr=0.002/2, b1=0.9)
+optimizer3 = Kron(raw_model.transformer.h.parameters(),           lr=0.02/4,  b1=0.9, verbose=True)
+optimizers = [optimizer1, optimizer2, optimizer3]
 # learning rate decay scheduler (linear warmup and warmdown)
 def get_lr(it):
     assert it <= args.num_iterations
@@ -475,8 +454,7 @@ if master_process and args.wandb_log:
     try:
         # Generate run name if not provided
         if args.wandb_run_name is None:
-            # Format muon_learning_rate to scientific notation with 1 decimal place
-            lr_str = f"{args.muon_learning_rate:.1e}"
+            lr_str = f"{0.02/4:.1e}"
             random_adj = random.choice(adjectives)
             args.wandb_run_name = f"{random_adj}_psgd_{lr_str}"
         
@@ -484,12 +462,18 @@ if master_process and args.wandb_log:
             project=args.wandb_project,
             name=args.wandb_run_name,
             config=vars(args),
-            settings=wandb.Settings(start_method="thread")  # Enable real-time streaming
+            settings=wandb.Settings(
+                start_method="thread",  # Enable real-time streaming
+                _disable_stats=True,    # Disable stats to reduce lag
+            )
         )
-        print(f"Successfully initialized wandb run: {args.wandb_run_name}")
+        # # Set a more frequent flush interval (in seconds)
+        # wandb.run._sync_interval = 1
+        # print(f"Successfully initialized wandb run: {args.wandb_run_name}")
     except Exception as e:
         print(f"Failed to initialize wandb: {e}")
         args.wandb_log = False  # Disable wandb logging if initialization fails
+
 
 # begin logging
 if master_process:
@@ -510,6 +494,7 @@ if master_process:
         result = subprocess.run(['nvidia-smi'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         f.write(f'{result.stdout}\n')
         f.write('='*100 + '\n')
+
 
 training_time_ms = 0
 # start the clock
@@ -538,36 +523,22 @@ for step in range(args.num_iterations + 1):
         val_loss = 0.0
         for _ in range(val_steps):
             x_val, y_val = val_loader.next_batch()
-            with ctx:
-                _, loss = model(x_val, y_val, return_logits=False)
+            with ctx: # of course, we'd like to use no_grad() here too, but that creates a torch.compile error for some reason
+                loss = model(x_val, y_val)
                 val_loss += loss.detach()
                 del loss
         dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
         val_loss /= val_steps
-        
-        # Add wandb logging for validation right here
-        if master_process and args.wandb_log:
-            log_dict = {
-                'val/loss': val_loss.item(),
-                'val/step': step
-            }
-            if args.count_nonzeros:
-                nonzero_fraction = count_nonzero_params(model)
-                log_dict['model/nonzero_fraction'] = nonzero_fraction
-            wandb.log(log_dict, step=step)  # Log validation metrics to wandb
-
-        # Your existing console and file logging...
-
-    # if master_process and (last_step or (args.save_every > 0 and step % args.save_every == 0)):
-    #     # stop the clock
-    #     torch.cuda.synchronize()
-    #     training_time_ms += 1000 * (time.time() - t0)
-    #     # save the state of the training process
-    #     log = dict(step=step, code=code, model=raw_model.state_dict(), optimizers=[opt.state_dict() for opt in optimizers])
-    #     # torch.save(log, 'logs/%s/state_step%06d.pt' % (run_id, step))
-    #     # start the clock again
-    #     torch.cuda.synchronize()
-    #     t0 = time.time()
+        if master_process and (last_step or (args.save_every > 0 and step % args.save_every == 0)):
+            # stop the clock
+            torch.cuda.synchronize()
+            training_time_ms += 1000 * (time.time() - t0)
+            # save the state of the training process
+            log = dict(step=step, code=code, model=raw_model.state_dict(), optimizers=[opt.state_dict() for opt in optimizers])
+            torch.save(log, 'logs/%s/state_step%06d.pt' % (run_id, step))
+            # start the clock again
+            torch.cuda.synchronize()
+            t0 = time.time()
 
     # bit confusing: we want to make sure to eval on 0th iteration
     # but also after the very last iteration. so we loop for step <= num_iterations
@@ -581,7 +552,7 @@ for step in range(args.num_iterations + 1):
     for i in range(1, train_accumulation_steps+1):
         # forward pass
         with ctx:
-            _, loss = model(x, y, return_logits=False)
+            loss = model(x, y)
             train_loss = loss.detach()
         # advance the dataset for the next batch
         x, y = train_loader.next_batch()
@@ -591,10 +562,13 @@ for step in range(args.num_iterations + 1):
                 loss.backward()
         else:
             loss.backward() # just sync on the last step
-
-    # After computing gradients but before optimizer step (around line 607)
+    
+    # After computing gradients but before optimizer step
     if master_process and args.wandb_log:
-        # Calculate gradient norm
+        # Calculate time metrics
+        approx_time = training_time_ms + 1000 * (time.time() - t0)
+        
+        # Calculate gradient norm and parameter norm
         total_grad_norm = 0.0
         for p in model.parameters():
             if p.grad is not None:
@@ -602,65 +576,72 @@ for step in range(args.num_iterations + 1):
                 total_grad_norm += param_norm.item() ** 2
         total_grad_norm = total_grad_norm ** (1. / 2)
         
-        # Calculate parameter norm
         total_param_norm = 0.0
         for p in model.parameters():
             param_norm = p.data.norm(2)
             total_param_norm += param_norm.item() ** 2
         total_param_norm = total_param_norm ** (1. / 2)
 
-    # Normalize gradients by accumulation steps (your existing code)
-    for p in model.parameters():
-        p.grad /= train_accumulation_steps
+        # Calculate energies from Kron optimizer
+        momentum_energy = 0.0
+        pre_grad_energy = 0.0
+        fake_momentum_energy = 0.0
+        num_params = 0
+        
+        for group in optimizer3.param_groups:
+            for p in group['params']:
+                state = optimizer3.state[p]
+                if 'momentum_buffer' in state:
+                    momentum_energy += torch.mean(state['momentum_buffer']**2).item()
+                if p.grad is not None:  # This is the actual preconditioned gradient
+                    pre_grad_energy += torch.mean(p.grad**2).item()
+                if 'fake_momentum' in state:
+                    fake_momentum_energy += torch.mean(state['fake_momentum']**2).item()
+                num_params += 1
+        
+            
+        log_dict = {
+            'train/loss': train_loss.item(),
+            'train/grad_norm': total_grad_norm,
+            'train/param_norm': total_param_norm,
+            'perf/train_time_ms': approx_time,
+            'perf/step_time_ms': approx_time/timed_steps,
+            'kron/momentum_energy': momentum_energy,
+            'kron/pre_grad_energy': pre_grad_energy,
+            'kron/fake_momentum_energy': fake_momentum_energy, # broken
+        }
+        wandb.log(log_dict, step=step)
 
-    # Step optimizers and schedulers (your existing code)
+    # Scale gradients for gradient accumulation
+    for p in model.parameters():
+        if p.grad is not None:
+            p.grad /= train_accumulation_steps
+
+    # step the optimizers and schedulers
     for opt, sched in zip(optimizers, schedulers):
         opt.step()
         sched.step()
-
-    # null the gradients (your existing code)
+    # null the gradients
     model.zero_grad(set_to_none=True)
-
-    # In your wandb logging section (around line 622), add the norms to the log_dict:
+    # In your wandb logging section, add learning rates with scheduler scaling:
     if master_process:
         approx_time = training_time_ms + 1000 * (time.time() - t0)
         if args.wandb_log:
+            # Get base learning rates multiplied by scheduler factor
+            lr_scale = get_lr(step)  # Current scheduler multiplier
+
+            
             log_dict = {
                 'train/loss': train_loss.item(),
                 'train/grad_norm': total_grad_norm,
                 'train/param_norm': total_param_norm,
                 'perf/train_time_ms': approx_time,
-                'perf/step_time_ms': approx_time/timed_steps
+                'perf/step_time_ms': approx_time/timed_steps,
             }
-            if args.count_nonzeros:
-                nonzero_fraction = count_nonzero_params(model)
-                log_dict['model/nonzero_fraction'] = nonzero_fraction
             wandb.log(log_dict, step=step)
-
-    #dist.all_reduce(train_loss, op=dist.ReduceOp.AVG) # all-reducing the training loss would be more correct in terms of logging, but slower
-    if master_process:
-        approx_time = training_time_ms + 1000 * (time.time() - t0)
-        # Create log dictionary for wandb
-        if args.wandb_log:
-            log_dict = {
-                'train/loss': train_loss.item(),
-                'perf/train_time_ms': approx_time,
-                'perf/step_time_ms': approx_time/timed_steps
-            }
-            if args.count_nonzeros:
-                nonzero_fraction = count_nonzero_params(model)
-                log_dict['model/nonzero_fraction'] = nonzero_fraction
-            wandb.log(log_dict, step=step)  # Log to wandb
-
-        # Your existing console and file logging...
-
 if master_process:
     print(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
 
 # -------------------------------------------------------------------------
 # clean up nice
 dist.destroy_process_group()
-
-# Finish wandb run
-if master_process and args.wandb_log:
-    wandb.finish()
