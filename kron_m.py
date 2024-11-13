@@ -62,6 +62,7 @@ class Kron(torch.optim.Optimizer):
         precond_dtype (torch.dtype, optional): Dtype of the preconditioner.
         verbose (bool): Whether to print energy statistics.
         use_grad_stats (bool): Whether to use gradient statistics for preconditioner update.
+        std_scale (float): Scale factor for the standard deviation in the fake momentum calculation.
     """
 
     def __init__(
@@ -79,6 +80,7 @@ class Kron(torch.optim.Optimizer):
         precond_dtype=None,
         verbose=False,
         use_grad_stats=True,
+        std_scale=1.0,
     ):
         if not 0.0 <= lr:
             raise ValueError(f"Invalid learning rate: {lr}")
@@ -99,12 +101,13 @@ class Kron(torch.optim.Optimizer):
             min_ndim_triangular=min_ndim_triangular,
             memory_save_mode=memory_save_mode,
             momentum_into_precond_update=momentum_into_precond_update,
-            precond_lr=0.1,  # precond lr hardcoded to 0.1
-            precond_init_scale=1.0,  # precond init scale hardcoded to 1.0
+            precond_lr=0.1,
+            precond_init_scale=1.0,
             mu_dtype=mu_dtype,
             precond_dtype=precond_dtype,
             verbose=verbose,
             use_grad_stats=use_grad_stats,
+            std_scale=std_scale,
         )
         super(Kron, self).__init__(params, defaults)
 
@@ -218,8 +221,8 @@ class Kron(torch.optim.Optimizer):
                 if do_update:
                     if group["use_grad_stats"] and self.momentum_count[p] > 0:
                         mean = self.momentum_mean[p]
-                        std = torch.sqrt(self.momentum_var[p] / self.momentum_count[p] + self._tiny)
-                        fake_momentum = mean + std * torch.randn_like(momentum_buffer, dtype=precond_dtype)
+                        std = torch.sqrt(self.momentum_var[p] / self.momentum_count[p] + self._eps)
+                        fake_momentum = mean + group["std_scale"] * std * torch.randn_like(momentum_buffer, dtype=precond_dtype)
                         
                         if group["verbose"]:
                             fake_momentum_energy = torch.mean(fake_momentum**2).item()
