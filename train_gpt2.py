@@ -432,7 +432,7 @@ optimizer1 = torch.optim.Adam([raw_model.transformer.wte.weight], lr=0.3,   beta
 optimizer2 = torch.optim.Adam([raw_model.lm_head.weight],         lr=0.002, betas=(0.9, 0.95), fused=True)
 # optimizer1 = Kron([raw_model.transformer.wte.weight], lr=0.3/2,   b1=0.9)
 # optimizer2 = Kron([raw_model.lm_head.weight],         lr=0.002/2, b1=0.9)
-optimizer3 = Kron(raw_model.transformer.h.parameters(),           lr=0.02/4,  b1=0.9, verbose=True)
+optimizer3 = Kron(raw_model.transformer.h.parameters(),           lr=0.002/4,  b1=0.9, verbose=True, std_scale=0.01)
 optimizers = [optimizer1, optimizer2, optimizer3]
 # learning rate decay scheduler (linear warmup and warmdown)
 def get_lr(it):
@@ -608,7 +608,7 @@ for step in range(args.num_iterations + 1):
             'perf/step_time_ms': approx_time/timed_steps,
             'kron/momentum_energy': momentum_energy,
             'kron/pre_grad_energy': pre_grad_energy,
-            'kron/fake_momentum_energy': fake_momentum_energy, # broken
+            'kron/fake_momentum_energy': fake_momentum_energy, # no work
         }
         wandb.log(log_dict, step=step)
 
